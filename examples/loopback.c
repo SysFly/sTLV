@@ -62,6 +62,8 @@ static void on_event(stlv_t *ctx, stlv_event_t ev, const stlv_event_info_t *info
     (void)user;
     if (ev == STLV_EV_SEQ_GAP) {
         printf("lost %u frame(s) before seq %u\n", info->lost, info->seq);
+    } else if (ev == STLV_EV_PEER_RESET) {
+        printf("peer restarted\n"); /* 在这里清理与对端相关的会话状态 */
     } else if (ev == STLV_EV_ERR_CRC) {
         printf("crc error\n");
     }
@@ -92,6 +94,10 @@ int main(void)
     /* 单 TLV 快捷发送 */
     stlv_send_tlv(&tx, MSG_NAME, "pump", 4);
 
+    /* 模拟发送端重启：重新 init 后序号归零并带 SYN，接收端会上报 PEER_RESET */
+    stlv_init(&tx, &tx_cfg);
+    stlv_send_tlv(&tx, MSG_PING, NULL, 0);
+
     /* 4. 拆包：任意分块喂入，回调里逐 TLV 处理 */
     for (size_t i = 0; i < wire_len; i += 5) {
         size_t n = wire_len - i < 5 ? wire_len - i : 5;
@@ -100,7 +106,7 @@ int main(void)
     stlv_rx_flush(&rx); /* 串口空闲 */
 
     const stlv_stats_t *s = stlv_stats(&rx);
-    printf("rx frames=%u tlvs=%u crc_err=%u\n", (unsigned)s->rx_frames, (unsigned)s->rx_tlvs,
-           (unsigned)s->err_crc);
+    printf("rx frames=%u tlvs=%u crc_err=%u peer_reset=%u\n", (unsigned)s->rx_frames,
+           (unsigned)s->rx_tlvs, (unsigned)s->err_crc, (unsigned)s->rx_peer_reset);
     return 0;
 }

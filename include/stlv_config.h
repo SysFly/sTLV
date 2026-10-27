@@ -53,11 +53,21 @@
 #endif
 
 /**
- * @brief 序号差值不超过该值时，视为中间丢了帧（STLV_EV_SEQ_GAP）；
- *        超过时视为重复帧或对端重启（STLV_EV_SEQ_JUMP），不计入丢帧数。取值 1..254。
+ * @brief 同一会话内 7 位序号前跳不超过该值时，视为中间丢了帧（STLV_EV_SEQ_GAP）；
+ *        超过时视为重复帧或回退（STLV_EV_SEQ_JUMP），不计入丢帧数。取值 1..126。
  */
 #ifndef STLV_SEQ_GAP_MAX
-#define STLV_SEQ_GAP_MAX 127
+#define STLV_SEQ_GAP_MAX 63
+#endif
+
+/**
+ * @brief 发送端初始化后，前多少帧带 SYN 标志，取值 1..127。
+ *
+ * 接收端凭 SYN 识别对端重启；值越大，越不容易因为 SYN 帧全部丢失而漏判，
+ * 只影响发送端行为，两端可以不同。
+ */
+#ifndef STLV_SYN_FRAMES
+#define STLV_SYN_FRAMES 4
 #endif
 
 #if STLV_TYPE_SIZE != 1 && STLV_TYPE_SIZE != 2
@@ -69,8 +79,11 @@
 #if STLV_MAX_PAYLOAD < 1 || STLV_MAX_PAYLOAD > 65535
 #error "STLV_MAX_PAYLOAD must be in 1..65535"
 #endif
-#if STLV_SEQ_GAP_MAX < 1 || STLV_SEQ_GAP_MAX > 254
-#error "STLV_SEQ_GAP_MAX must be in 1..254"
+#if STLV_SEQ_GAP_MAX < 1 || STLV_SEQ_GAP_MAX > 126
+#error "STLV_SEQ_GAP_MAX must be in 1..126"
+#endif
+#if STLV_SYN_FRAMES < 1 || STLV_SYN_FRAMES > 127
+#error "STLV_SYN_FRAMES must be in 1..127"
 #endif
 
 #endif /* STLV_CONFIG_H */

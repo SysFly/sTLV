@@ -5,12 +5,13 @@
  * 帧格式（多字节字段均为小端）：
  * @verbatim
  *  +------+------+-----+---------+-----+----------------------+---------+
- *  | SOF0 | SOF1 | SEQ | LEN(2B) | HCS | PAYLOAD (LEN bytes)  | CRC(2B) |
+ *  | SOF0 | SOF1 | CTL | LEN(2B) | HCS | PAYLOAD (LEN bytes)  | CRC(2B) |
  *  +------+------+-----+---------+-----+----------------------+---------+
- *    0xA5   0x5A   0-255  LE       CRC8   TLV TLV TLV ...        CRC16
+ *    0xA5   0x5A          LE       CRC8   TLV TLV TLV ...        CRC16
  *
- *  HCS   = CRC-8 (poly 0x07, init 0x00) over SEQ..LEN    (3 bytes)
- *  CRC   = CRC-16/CCITT-FALSE           over SEQ..PAYLOAD
+ *  CTL   = bit7 SYN | bit0-6 SEQ（发送端初始化后的前 STLV_SYN_FRAMES 帧置 SYN）
+ *  HCS   = CRC-8 (poly 0x07, init 0x00) over CTL..LEN    (3 bytes)
+ *  CRC   = CRC-16/CCITT-FALSE           over CTL..PAYLOAD
  *  TLV   = TYPE (STLV_TYPE_SIZE B) | LEN (STLV_LEN_SIZE B) | VALUE (LEN B)
  * @endverbatim
  *
@@ -30,12 +31,16 @@
 extern "C" {
 #endif
 
-/** @brief 帧头长度：SOF0 SOF1 SEQ LEN(2) HCS。 */
+/** @brief 帧头长度：SOF0 SOF1 CTL LEN(2) HCS。 */
 #define STLV_HDR_SIZE 6u
 /** @brief 帧尾长度：CRC16。 */
 #define STLV_CRC_SIZE 2u
 /** @brief 单帧固定开销字节数。 */
 #define STLV_FRAME_OVERHEAD (STLV_HDR_SIZE + STLV_CRC_SIZE)
+/** @brief CTL 字节中的序号掩码（7 位序号）。 */
+#define STLV_SEQ_MASK 0x7Fu
+/** @brief CTL 字节中的 SYN 标志：发送端刚启动。 */
+#define STLV_FLAG_SYN 0x80u
 /** @brief 单个 TLV 头（Type+Length）字节数。 */
 #define STLV_TLV_HDR_SIZE (STLV_TYPE_SIZE + STLV_LEN_SIZE)
 /** @brief 承载 @p payload 字节 payload 的完整帧所需缓冲区大小。 */
@@ -181,11 +186,13 @@ static inline const uint8_t *stlv_build_payload(const stlv_builder_t *b)
 
 /**
  * @brief 写入帧头和 CRC，完成组帧；之后仍可继续 put 并再次 finish。
+ *
+ * 通过 stlv_send() 发送时由实例自动填写 CTL，无需调用本函数。
  * @param b   构建器。
- * @param seq 帧序号。
+ * @param ctl CTL 字节：序号（0..127）| 可选 STLV_FLAG_SYN。
  * @return 完整帧长度（帧从 b->buf 开始）；构建器无效时返回 0。
  */
-size_t stlv_build_finish(stlv_builder_t *b, uint8_t seq);
+size_t stlv_build_finish(stlv_builder_t *b, uint8_t ctl);
 
 /** @} */
 
@@ -200,18 +207,19 @@ typedef struct stlv stlv_t;
 typedef enum {
     STLV_EV_FRAME_BEGIN,   /**< 收到有效帧，即将分发 TLV。 */
     STLV_EV_FRAME_END,     /**< 该帧 TLV 分发完毕。 */
-    STLV_EV_SEQ_GAP,       /**< 序号前跳不超过 STLV_SEQ_GAP_MAX，info->lost 为丢失的帧数。 */
+    STLV_EV_SEQ_GAP,       /**< 同一会话内序号前跳不超过 STLV_SEQ_GAP_MAX，info->lost 为丢失的帧数。 */
     STLV_EV_ERR_HEADER,    /**< 帧头校验失败或 LEN 超过 STLV_MAX_PAYLOAD。 */
     STLV_EV_ERR_CRC,       /**< 帧 CRC 校验失败。 */
     STLV_EV_ERR_FORMAT,    /**< CRC 正确但 TLV 结构损坏，视为假帧丢弃并重新同步。 */
     STLV_EV_TLV_UNKNOWN,   /**< Type 不在类型表中，该 TLV 跳过。 */
     STLV_EV_TLV_BAD_LEN,   /**< Value 长度不符合类型表，该 TLV 跳过。 */
-    STLV_EV_SEQ_JUMP       /**< 序号跳变超过 STLV_SEQ_GAP_MAX（重复帧或对端重启），不计入丢帧。 */
+    STLV_EV_SEQ_JUMP,      /**< 序号对不上（重复帧、回退或前跳过大），重新同步，不计入丢帧。 */
+    STLV_EV_PEER_RESET     /**< 收到新会话的 SYN 帧，判定对端已重启，重新同步，不计入丢帧。 */
 } stlv_event_t;
 
 /** @brief 事件附带信息，按事件类型取用相关字段。 */
 typedef struct {
-    uint8_t seq;          /**< 帧序号；ERR_HEADER/ERR_CRC 时为未经校验的原始值。 */
+    uint8_t seq;          /**< 7 位帧序号；ERR_HEADER/ERR_CRC 时为未经校验的原始 CTL 字节。 */
     uint8_t lost;         /**< 丢失帧数（SEQ_GAP），其余事件为 0。 */
     uint16_t payload_len; /**< payload 长度；ERR_HEADER/ERR_CRC 时为未经校验的原始值。 */
     const stlv_tlv_t *tlv;/**< 相关 TLV（TLV_*），其余事件为 NULL。 */
@@ -252,7 +260,8 @@ typedef struct {
     uint32_t rx_frames;       /**< 收到的有效帧。 */
     uint32_t rx_tlvs;         /**< 分发的 TLV。 */
     uint32_t rx_lost;         /**< 按序号推断丢失的帧。 */
-    uint32_t rx_seq_jump;     /**< 序号跳变次数（重复帧或对端重启）。 */
+    uint32_t rx_seq_jump;     /**< 序号跳变次数（重复帧、回退或前跳过大）。 */
+    uint32_t rx_peer_reset;   /**< 检测到对端重启的次数。 */
     uint32_t rx_discarded;    /**< 重同步时丢弃的字节。 */
     uint32_t err_header;      /**< 帧头错误次数。 */
     uint32_t err_crc;         /**< CRC 错误次数。 */
@@ -274,6 +283,8 @@ struct stlv {
     uint32_t rx_len;                /**< 接收缓冲区有效字节数。 */
     uint8_t rx_expect_seq;          /**< 期望的下一帧序号。 */
     uint8_t rx_seq_valid;           /**< 是否已收到过有效帧。 */
+    uint8_t rx_last_syn;            /**< 上一有效帧是否带 SYN。 */
+    uint8_t tx_syn_left;            /**< 还要带 SYN 发送的帧数。 */
     uint8_t rx_busy;                /**< 防重入标志。 */
     uint8_t tx_seq;                 /**< 下一帧发送序号。 */
     uint8_t rx_buf[STLV_MAX_FRAME]; /**< 接收缓冲区。 */

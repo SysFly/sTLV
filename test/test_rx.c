@@ -5,6 +5,7 @@
 #include "tinytest.h"
 
 #define MAX_REC 64
+#define TX_CAP (4 * STLV_MAX_FRAME > 2048 ? 4 * STLV_MAX_FRAME : 2048)
 
 typedef struct {
     /* 收到的 TLV */
@@ -13,11 +14,11 @@ typedef struct {
     stlv_len_t len[MAX_REC];
     uint8_t first[MAX_REC];
     /* 事件 */
-    int ev_count[STLV_EV_SEQ_JUMP + 1];
+    int ev_count[STLV_EV_PEER_RESET + 1];
     uint8_t last_seq;
     uint8_t last_lost;
     /* 发送捕获 */
-    uint8_t tx[4 * STLV_MAX_FRAME];
+    uint8_t tx[TX_CAP];
     size_t tx_len;
     int tx_calls;
     int tx_fail;
@@ -82,6 +83,7 @@ static int cap_write(const uint8_t *data, size_t len, void *user)
     if (c->tx_fail || c->fail_write_at == c->tx_calls) {
         return -1;
     }
+    CHECK(c->tx_len + len <= sizeof(c->tx));
     if (c->tx_len + len <= sizeof(c->tx)) {
         memcpy(c->tx + c->tx_len, data, len);
         c->tx_len += len;
@@ -292,10 +294,12 @@ static void test_seq_tracking(void)
     cap_t c;
     setup(&s, &c, NULL, 0);
 
-    /* 首帧任意序号，不报丢帧；254 -> 255 -> 0 回绕连续；
-       1 -> 5 丢 3 帧；6 -> 6 重复帧、6 -> 3 回退、4 -> 0x85 前跳 128 都视为跳变 */
-    static const uint8_t seqs[] = {254, 255, 0, 1, 5, 6, 6, 3, 4, 0x85,
-                                   (uint8_t)(0x86 + STLV_SEQ_GAP_MAX)};
+    /* 首帧任意序号，不报丢帧；126 -> 127 -> 0 回绕连续；1 -> 5 丢 3 帧；
+       6 -> 6 重复帧、6 -> 3 回退、4 -> 5+GAP_MAX+1 前跳过大都视为跳变；
+       最后一帧前跳恰好 STLV_SEQ_GAP_MAX，仍算丢帧 */
+    const uint8_t j = (uint8_t)((5 + STLV_SEQ_GAP_MAX + 1) & STLV_SEQ_MASK);
+    const uint8_t seqs[] = {126, 127, 0, 1, 5, 6, 6, 3, 4, j,
+                            (uint8_t)((j + 1 + STLV_SEQ_GAP_MAX) & STLV_SEQ_MASK)};
     for (size_t i = 0; i < sizeof(seqs); i++) {
         size_t n = make_frame(f, seqs[i], ITEMS, 1);
         stlv_rx_feed(&s, f, n);
@@ -307,10 +311,129 @@ static void test_seq_tracking(void)
     CHECK_EQ(stlv_stats(&s)->rx_frames, sizeof(seqs));
     CHECK_EQ(c.ev_count[STLV_EV_SEQ_JUMP], 3);
     CHECK_EQ(stlv_stats(&s)->rx_seq_jump, 3);
-    /* 最后一帧前跳恰好 STLV_SEQ_GAP_MAX，仍算丢帧 */
     CHECK_EQ(c.ev_count[STLV_EV_SEQ_GAP], 2);
     CHECK_EQ(c.last_lost, STLV_SEQ_GAP_MAX);
     CHECK_EQ(stlv_stats(&s)->rx_lost, 3 + STLV_SEQ_GAP_MAX);
+    CHECK_EQ(c.ev_count[STLV_EV_PEER_RESET], 0);
+}
+
+/* 发送端 tx 发 n 帧，字节追加到 c->tx */
+static void send_frames(stlv_t *tx, int n)
+{
+    for (int i = 0; i < n; i++) {
+        CHECK_EQ(stlv_send_tlv(tx, (stlv_type_t)(0x40 + i), V, 2), STLV_OK);
+    }
+}
+
+/* 从发送捕获中删除第 k 帧（从 0 计）；帧长固定为 fl */
+static void drop_frame(cap_t *c, size_t k, size_t fl)
+{
+    memmove(c->tx + k * fl, c->tx + (k + 1) * fl, c->tx_len - (k + 1) * fl);
+    c->tx_len -= fl;
+}
+
+static void test_peer_reset(void)
+{
+    const size_t fl = STLV_FRAME_SIZE(STLV_TLV_HDR_SIZE + 2);
+    const int pre = 10; /* 重启前已发帧数，确保序号不是 0 */
+    stlv_t tx, rx;
+    cap_t ct, cr;
+
+    /* 1. 发送端前 STLV_SYN_FRAMES 帧带 SYN，之后不带 */
+    setup(&tx, &ct, NULL, 0);
+    send_frames(&tx, STLV_SYN_FRAMES + 1);
+    for (int i = 0; i <= STLV_SYN_FRAMES; i++) {
+        uint8_t ctl = ct.tx[(size_t)i * fl + 2];
+        CHECK_EQ(ctl & STLV_SEQ_MASK, i);
+        CHECK_EQ((ctl & STLV_FLAG_SYN) != 0, i < STLV_SYN_FRAMES);
+    }
+
+    /* 2. 正常重启：识别为 PEER_RESET，不计丢帧，重启后的帧照常分发 */
+    for (int lost_after = 0; lost_after < 3; lost_after++) {
+        setup(&tx, &ct, NULL, 0);
+        setup(&rx, &cr, NULL, 0);
+        send_frames(&tx, pre);
+        reinit(&tx, &ct); /* 对端重启 */
+        send_frames(&tx, STLV_SYN_FRAMES + 2);
+        /* 重启后的前 lost_after 帧（SYN 帧）丢失，只要还剩一个 SYN 帧就能识别 */
+        for (int k = 0; k < lost_after; k++) {
+            drop_frame(&ct, (size_t)pre, fl);
+        }
+        stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+        CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 1);
+        CHECK_EQ(cr.ev_count[STLV_EV_PEER_RESET], 1);
+        CHECK_EQ(stlv_stats(&rx)->rx_lost, 0);
+        CHECK_EQ(stlv_stats(&rx)->rx_seq_jump, 0);
+        CHECK_EQ(cr.n_tlv, pre + STLV_SYN_FRAMES + 2 - lost_after);
+    }
+
+    /* 3. 重启后同一启动序列内丢帧：不能误报重启，按丢帧统计 */
+    if (STLV_SYN_FRAMES >= 3) {
+        setup(&tx, &ct, NULL, 0);
+        setup(&rx, &cr, NULL, 0);
+        send_frames(&tx, pre);
+        reinit(&tx, &ct);
+        send_frames(&tx, STLV_SYN_FRAMES + 2);
+        drop_frame(&ct, (size_t)pre + 1, fl); /* 新会话 seq1 丢失 */
+        stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+        CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 1);
+        CHECK_EQ(stlv_stats(&rx)->rx_lost, 1);
+    }
+
+    /* 4. 对端连续重启两次（第一次只来得及发 1 帧） */
+    setup(&tx, &ct, NULL, 0);
+    setup(&rx, &cr, NULL, 0);
+    send_frames(&tx, pre);
+    reinit(&tx, &ct);
+    send_frames(&tx, 1);
+    reinit(&tx, &ct);
+    send_frames(&tx, 3);
+    stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+    CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 2);
+    CHECK_EQ(stlv_stats(&rx)->rx_lost, 0);
+
+    /* 5. 重启时最后一帧只发出一半，紧跟 bootloader 打印的乱码，再接新会话 */
+    setup(&tx, &ct, NULL, 0);
+    setup(&rx, &cr, NULL, 0);
+    send_frames(&tx, pre);
+    ct.tx_len -= fl / 2; /* 截断最后一帧 */
+    static const char boot_msg[] = "\r\nBootloader v1.2 \xA5\x5A\xA5 jumping to app...\r\n";
+    memcpy(ct.tx + ct.tx_len, boot_msg, sizeof(boot_msg) - 1);
+    ct.tx_len += sizeof(boot_msg) - 1;
+    reinit(&tx, &ct);
+    send_frames(&tx, 3);
+    stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+    CHECK_EQ(stlv_stats(&rx)->rx_frames, (uint32_t)(pre - 1 + 3));
+    CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 1);
+    CHECK_EQ(stlv_stats(&rx)->rx_lost, 0);
+
+    /* 6. 本端（接收端）自己刚启动，收到的第一帧就是 SYN：只建立基准，不报重启 */
+    setup(&tx, &ct, NULL, 0);
+    setup(&rx, &cr, NULL, 0);
+    send_frames(&tx, 2);
+    stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+    CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 0);
+    CHECK_EQ(stlv_stats(&rx)->rx_frames, 2);
+
+    /* 7. 已知局限：SYN 帧全部丢失时无法识别重启，退化为按序号差值判断 */
+    setup(&tx, &ct, NULL, 0);
+    setup(&rx, &cr, NULL, 0);
+    send_frames(&tx, pre);
+    reinit(&tx, &ct);
+    send_frames(&tx, STLV_SYN_FRAMES + 1);
+    for (int k = 0; k < STLV_SYN_FRAMES; k++) {
+        drop_frame(&ct, (size_t)pre, fl);
+    }
+    stlv_rx_feed(&rx, ct.tx, ct.tx_len);
+    CHECK_EQ(stlv_stats(&rx)->rx_peer_reset, 0);
+    CHECK_EQ(stlv_stats(&rx)->rx_frames, (uint32_t)(pre + 1));
+    /* 期望 pre，收到 STLV_SYN_FRAMES：差值 (SYN_FRAMES - pre) mod 128 */
+    uint8_t gap = (uint8_t)((STLV_SYN_FRAMES - pre) & STLV_SEQ_MASK);
+    if (gap <= STLV_SEQ_GAP_MAX) {
+        CHECK_EQ(stlv_stats(&rx)->rx_lost, gap);
+    } else {
+        CHECK_EQ(stlv_stats(&rx)->rx_seq_jump, 1);
+    }
 }
 
 static void test_format_error(void)
@@ -376,7 +499,7 @@ static void test_send_paths(void)
 
     /* send_tlv 与 builder 产生相同字节 */
     uint8_t ref[STLV_MAX_FRAME];
-    size_t nref = make_frame(ref, 0, ITEMS + 2, 1);
+    size_t nref = make_frame(ref, STLV_FLAG_SYN | 0, ITEMS + 2, 1);
     CHECK_EQ(stlv_send_tlv(&s, ITEMS[2].type, ITEMS[2].value, ITEMS[2].len), STLV_OK);
     CHECK_EQ(c.tx_len, nref);
     CHECK_MEM(c.tx, ref, nref);
@@ -387,7 +510,7 @@ static void test_send_paths(void)
     stlv_build_begin(&b, buf, sizeof(buf));
     stlv_build_put_items(&b, ITEMS, 3);
     CHECK_EQ(stlv_send(&s, &b), STLV_OK);
-    CHECK_EQ(c.tx[nref + 2], 1);
+    CHECK_EQ(c.tx[nref + 2], STLV_SYN_FRAMES > 1 ? (STLV_FLAG_SYN | 1) : 1);
     CHECK_EQ(stlv_stats(&s)->tx_frames, 2);
 
     /* 写失败：返回 IO，序号仍然前进 */
@@ -397,7 +520,7 @@ static void test_send_paths(void)
     c.tx_fail = 0;
     size_t before = c.tx_len;
     CHECK_EQ(stlv_send_tlv(&s, 1, NULL, 0), STLV_OK);
-    CHECK_EQ(c.tx[before + 2], 4);
+    CHECK_EQ(c.tx[before + 2] & STLV_SEQ_MASK, 4);
     CHECK_EQ(stlv_stats(&s)->tx_frames, 3);
 
     /* 超长单 TLV */
@@ -564,6 +687,7 @@ void suite_rx(void)
     RUN_TEST(test_bad_frames_recover);
     RUN_TEST(test_flush_releases_waiting_frame);
     RUN_TEST(test_seq_tracking);
+    RUN_TEST(test_peer_reset);
     RUN_TEST(test_format_error);
     RUN_TEST(test_type_table);
     RUN_TEST(test_send_paths);

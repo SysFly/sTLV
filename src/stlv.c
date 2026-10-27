@@ -9,7 +9,7 @@
 /* 帧内偏移 */
 #define OFF_SOF0 0u
 #define OFF_SOF1 1u
-#define OFF_SEQ 2u
+#define OFF_CTL 2u
 #define OFF_LEN 3u
 #define OFF_HCS 5u
 #define OFF_PAYLOAD STLV_HDR_SIZE
@@ -124,15 +124,15 @@ static void rd_tlv_hdr(const uint8_t *p, stlv_type_t *type, stlv_len_t *len)
 #endif
 }
 
-/* 写 SOF/SEQ/LEN/HCS，返回从 SEQ 开始的 CRC 中间值 */
-static uint16_t wr_frame_hdr(uint8_t *hdr, uint8_t seq, uint16_t plen)
+/* 写 SOF/CTL/LEN/HCS，返回从 CTL 开始的 CRC 中间值 */
+static uint16_t wr_frame_hdr(uint8_t *hdr, uint8_t ctl, uint16_t plen)
 {
     hdr[OFF_SOF0] = STLV_SOF0;
     hdr[OFF_SOF1] = STLV_SOF1;
-    hdr[OFF_SEQ] = seq;
+    hdr[OFF_CTL] = ctl;
     wr_u16(hdr + OFF_LEN, plen);
-    hdr[OFF_HCS] = stlv_crc8(0, hdr + OFF_SEQ, 3);
-    return stlv_crc16(0xFFFFu, hdr + OFF_SEQ, STLV_HDR_SIZE - OFF_SEQ);
+    hdr[OFF_HCS] = stlv_crc8(0, hdr + OFF_CTL, 3);
+    return stlv_crc16(0xFFFFu, hdr + OFF_CTL, STLV_HDR_SIZE - OFF_CTL);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -247,12 +247,12 @@ int stlv_build_put_u32(stlv_builder_t *b, stlv_type_t type, uint32_t v)
     return stlv_build_put(b, type, d, sizeof(d));
 }
 
-size_t stlv_build_finish(stlv_builder_t *b, uint8_t seq)
+size_t stlv_build_finish(stlv_builder_t *b, uint8_t ctl)
 {
     if (b == NULL || b->cap == 0) {
         return 0;
     }
-    uint16_t crc = wr_frame_hdr(b->buf, seq, (uint16_t)b->len);
+    uint16_t crc = wr_frame_hdr(b->buf, ctl, (uint16_t)b->len);
     crc = stlv_crc16(crc, b->buf + OFF_PAYLOAD, b->len);
     wr_u16(b->buf + OFF_PAYLOAD + b->len, crc);
     return STLV_FRAME_SIZE(b->len);
@@ -277,6 +277,7 @@ int stlv_init_abi(stlv_t *ctx, const stlv_cfg_t *cfg, uint32_t abi)
     }
     memset(ctx, 0, sizeof(*ctx));
     ctx->cfg = *cfg;
+    ctx->tx_syn_left = STLV_SYN_FRAMES;
     return STLV_OK;
 }
 
@@ -302,10 +303,48 @@ static const stlv_type_desc_t *find_type(const stlv_t *ctx, stlv_type_t type)
     return NULL;
 }
 
-/* 分发一个 CRC 正确的帧；TLV 结构损坏时返回 false（多半是误判的假帧，由调用方重扫） */
-static bool rx_deliver(stlv_t *ctx, uint8_t seq, const uint8_t *payload, uint16_t plen)
+/*
+ * 序号跟踪。规则：
+ *  - SYN 帧且不是"紧接上一 SYN 帧的同一启动序列"（上一帧带 SYN 且序号更小）=> 对端重启；
+ *  - 否则按 7 位序号差值判断：0 正常，<= STLV_SEQ_GAP_MAX 丢帧，其余为跳变。
+ * 首帧只建立基准。先更新状态再发事件，回调中重新 init 也安全。
+ */
+static void rx_track_seq(stlv_t *ctx, uint8_t ctl, stlv_event_info_t *info)
 {
-    stlv_event_info_t info = {seq, 0, plen, NULL};
+    uint8_t seq = (uint8_t)(ctl & STLV_SEQ_MASK);
+    bool syn = (ctl & STLV_FLAG_SYN) != 0;
+    bool known = ctx->rx_seq_valid != 0;
+    uint8_t prev = (uint8_t)((ctx->rx_expect_seq - 1u) & STLV_SEQ_MASK);
+    bool same_burst = ctx->rx_last_syn && seq > prev;
+    uint8_t gap = (uint8_t)((seq - ctx->rx_expect_seq) & STLV_SEQ_MASK);
+
+    ctx->rx_expect_seq = (uint8_t)((seq + 1u) & STLV_SEQ_MASK);
+    ctx->rx_seq_valid = 1;
+    ctx->rx_last_syn = syn;
+
+    if (!known) {
+        return;
+    }
+    if (syn && !same_burst) {
+        ctx->stats.rx_peer_reset++;
+        emit(ctx, STLV_EV_PEER_RESET, info);
+    } else if (gap == 0) {
+        /* 连续 */
+    } else if (gap <= STLV_SEQ_GAP_MAX) {
+        info->lost = gap;
+        ctx->stats.rx_lost += gap;
+        emit(ctx, STLV_EV_SEQ_GAP, info);
+        info->lost = 0;
+    } else {
+        ctx->stats.rx_seq_jump++;
+        emit(ctx, STLV_EV_SEQ_JUMP, info);
+    }
+}
+
+/* 分发一个 CRC 正确的帧；TLV 结构损坏时返回 false（多半是误判的假帧，由调用方重扫） */
+static bool rx_deliver(stlv_t *ctx, uint8_t ctl, const uint8_t *payload, uint16_t plen)
+{
+    stlv_event_info_t info = {(uint8_t)(ctl & STLV_SEQ_MASK), 0, plen, NULL};
 
     if (stlv_validate(payload, plen) < 0) {
         ctx->stats.err_format++;
@@ -313,23 +352,11 @@ static bool rx_deliver(stlv_t *ctx, uint8_t seq, const uint8_t *payload, uint16_
         return false;
     }
 
-    uint8_t gap = (uint8_t)(seq - ctx->rx_expect_seq);
-    bool seq_valid = ctx->rx_seq_valid != 0;
-    ctx->rx_expect_seq = (uint8_t)(seq + 1u);
-    ctx->rx_seq_valid = 1;
     ctx->stats.rx_frames++;
-    if (seq_valid && gap != 0) {
-        if (gap <= STLV_SEQ_GAP_MAX) {
-            info.lost = gap;
-            ctx->stats.rx_lost += gap;
-            emit(ctx, STLV_EV_SEQ_GAP, &info);
-            info.lost = 0;
-        } else {
-            ctx->stats.rx_seq_jump++;
-            emit(ctx, STLV_EV_SEQ_JUMP, &info);
-        }
+    rx_track_seq(ctx, ctl, &info);
+    if (!ctx->rx_busy) {
+        return true;
     }
-
     emit(ctx, STLV_EV_FRAME_BEGIN, &info);
 
     /* 每次回调后检查 rx_busy：回调中重新 init 会清零它，此时 payload 已失效 */
@@ -406,12 +433,12 @@ static void rx_process(stlv_t *ctx)
         }
 
         uint16_t plen = stlv_rd_u16(b + OFF_LEN);
-        if (stlv_crc8(0, b + OFF_SEQ, 3) != b[OFF_HCS]
+        if (stlv_crc8(0, b + OFF_CTL, 3) != b[OFF_HCS]
 #if STLV_MAX_PAYLOAD < 65535
             || plen > STLV_MAX_PAYLOAD
 #endif
         ) {
-            stlv_event_info_t info = {b[OFF_SEQ], 0, plen, NULL};
+            stlv_event_info_t info = {b[OFF_CTL], 0, plen, NULL};
             ctx->stats.err_header++;
             emit(ctx, STLV_EV_ERR_HEADER, &info);
             rx_drop(ctx, 1, true);
@@ -423,16 +450,16 @@ static void rx_process(stlv_t *ctx)
             return;
         }
 
-        uint16_t crc = stlv_crc16(0xFFFFu, b + OFF_SEQ, flen - OFF_SEQ - STLV_CRC_SIZE);
+        uint16_t crc = stlv_crc16(0xFFFFu, b + OFF_CTL, flen - OFF_CTL - STLV_CRC_SIZE);
         if (crc != stlv_rd_u16(b + OFF_PAYLOAD + plen)) {
-            stlv_event_info_t info = {b[OFF_SEQ], 0, plen, NULL};
+            stlv_event_info_t info = {b[OFF_CTL], 0, plen, NULL};
             ctx->stats.err_crc++;
             emit(ctx, STLV_EV_ERR_CRC, &info);
             rx_drop(ctx, 1, true);
             continue;
         }
 
-        if (rx_deliver(ctx, b[OFF_SEQ], b + OFF_PAYLOAD, plen)) {
+        if (rx_deliver(ctx, b[OFF_CTL], b + OFF_PAYLOAD, plen)) {
             rx_drop(ctx, flen, false);
         } else {
             rx_drop(ctx, 1, true);
@@ -498,16 +525,24 @@ static int tx_write(stlv_t *ctx, const uint8_t *data, size_t len)
     return ctx->cfg.write(data, len, ctx->cfg.user) == 0 ? STLV_OK : STLV_ERR_IO;
 }
 
+/* 取下一帧的 CTL 并推进发送状态（写失败也推进，接收端据此识别丢帧） */
+static uint8_t tx_next_ctl(stlv_t *ctx)
+{
+    uint8_t ctl = ctx->tx_seq;
+    if (ctx->tx_syn_left != 0) {
+        ctl |= STLV_FLAG_SYN;
+        ctx->tx_syn_left--;
+    }
+    ctx->tx_seq = (uint8_t)((ctx->tx_seq + 1u) & STLV_SEQ_MASK);
+    return ctl;
+}
+
 int stlv_send(stlv_t *ctx, stlv_builder_t *b)
 {
-    if (ctx == NULL || ctx->cfg.write == NULL) {
+    if (ctx == NULL || ctx->cfg.write == NULL || b == NULL || b->cap == 0) {
         return STLV_ERR_PARAM;
     }
-    size_t flen = stlv_build_finish(b, ctx->tx_seq);
-    if (flen == 0) {
-        return STLV_ERR_PARAM;
-    }
-    ctx->tx_seq++;
+    size_t flen = stlv_build_finish(b, tx_next_ctl(ctx));
     int rc = tx_write(ctx, b->buf, flen);
     if (rc == STLV_OK) {
         ctx->stats.tx_frames++;
@@ -527,7 +562,7 @@ int stlv_send_tlv(stlv_t *ctx, stlv_type_t type, const void *value, size_t len)
     }
 
     uint8_t hdr[STLV_HDR_SIZE + STLV_TLV_HDR_SIZE];
-    uint16_t crc = wr_frame_hdr(hdr, ctx->tx_seq++, (uint16_t)plen);
+    uint16_t crc = wr_frame_hdr(hdr, tx_next_ctl(ctx), (uint16_t)plen);
     wr_tlv_hdr(hdr + STLV_HDR_SIZE, type, (stlv_len_t)len);
     crc = stlv_crc16(crc, hdr + STLV_HDR_SIZE, STLV_TLV_HDR_SIZE);
     crc = stlv_crc16(crc, value, len);

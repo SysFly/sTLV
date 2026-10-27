@@ -1,10 +1,13 @@
 /*
  * 故障注入测试：发送端产生确定性的帧序列，经过有损信道（丢帧、丢字节、插入字节、
- * 比特翻转、截断、帧间噪声/假帧头），以随机分块喂给接收端，并在随机的帧间空闲点调用
- * stlv_rx_flush()。断言：
+ * 比特翻转、截断、帧间噪声/假帧头），发送端还会随机"重启"（序号归零、重新发 SYN，
+ * 重启瞬间正在发的帧可能被截断，并插入 bootloader 乱码）。字节流以随机分块喂给接收端，
+ * 并在随机的帧间空闲点调用 stlv_rx_flush()。断言：
  *   1. 所有交付的帧内容与发送内容完全一致（无误收）；
  *   2. 交付帧序列 == 预言机根据最终字节流推出的完好帧序列（好帧一个不丢）；
- *   3. 序号推断的丢帧数 == 首尾交付帧之间实际损坏的帧数；
+ *   3. 对每对相邻交付帧，预言机按真实会话独立推出期望结果：同一会话内丢了几帧、
+ *      跨会话时是否可识别为对端重启（可识别 => 必须报 PEER_RESET 且不计丢帧；
+ *      SYN 帧全丢等已知局限 => 按序号差值退化处理），统计值必须完全一致；
  *   4. 丢弃字节数 + 有效帧字节数 == 信道输出总字节数。
  *
  * 环境变量 STLV_FAULT_SEED / STLV_FAULT_FRAMES 可覆盖种子和帧数做长时间浸泡测试。
@@ -53,6 +56,7 @@ typedef struct {
     unsigned truncate;    /* 帧被截断 */
     unsigned noise;       /* 帧后插入噪声（不损坏帧本身） */
     unsigned idle;        /* 帧后出现空闲，接收端 flush */
+    unsigned reboot;      /* 发送此帧前发送端重启 */
 } scenario_t;
 
 /* 向构建器写入帧 idx 的确定性 payload */
@@ -92,6 +96,7 @@ static void gen_payload(uint32_t seed, uint32_t idx, uint8_t *frame_buf, stlv_bu
 
 typedef struct {
     uint32_t seed;
+    const uint8_t *ctl; /* 每帧发送时的 CTL 字节 */
     uint8_t rebuilt[STLV_MAX_FRAME];
     stlv_builder_t b;
     uint32_t *delivered;
@@ -126,7 +131,7 @@ static void fault_on_event(stlv_t *ctx, stlv_event_t ev, const stlv_event_info_t
         uint8_t expect[STLV_MAX_FRAME];
         stlv_builder_t eb;
         gen_payload(c->seed, idx, expect, &eb);
-        if (eb.len != c->b.len || info->seq != (uint8_t)idx ||
+        if (eb.len != c->b.len || info->seq != (c->ctl[idx] & STLV_SEQ_MASK) ||
             memcmp(stlv_build_payload(&eb), stlv_build_payload(&c->b), eb.len) != 0) {
             c->false_accepts++;
             return;
@@ -240,8 +245,8 @@ static int spans_idle(const stream_t *st, size_t a, size_t n)
  * 且不跨越空闲点，即为候选；
  * 再按从左到右、互不重叠贪心选取（一个字节只能属于一帧）。
  */
-static size_t oracle(uint32_t seed, uint32_t frames, const size_t *start, const stream_t *st,
-                     uint32_t *expect, uint64_t *expect_bytes)
+static size_t oracle(uint32_t seed, uint32_t frames, const size_t *start, const uint8_t *ctl,
+                     const stream_t *st, uint32_t *expect, uint64_t *expect_bytes)
 {
     size_t n_expect = 0, cursor = 0;
     *expect_bytes = 0;
@@ -252,7 +257,7 @@ static size_t oracle(uint32_t seed, uint32_t frames, const size_t *start, const 
         uint8_t f[STLV_MAX_FRAME];
         stlv_builder_t b;
         gen_payload(seed, i, f, &b);
-        size_t n = stlv_build_finish(&b, (uint8_t)i);
+        size_t n = stlv_build_finish(&b, ctl[i]);
         size_t first = start[i] > cursor ? start[i] - 1 : cursor;
         for (size_t off = first; off <= start[i] + 1 && off + n <= st->len; off++) {
             if (off >= cursor && memcmp(st->data + off, f, n) == 0 &&
@@ -267,6 +272,48 @@ static size_t oracle(uint32_t seed, uint32_t frames, const size_t *start, const 
     return n_expect;
 }
 
+typedef struct {
+    uint32_t lost;       /* 期望 rx_lost */
+    uint32_t reset;      /* 期望 rx_peer_reset */
+    uint32_t jump;       /* 期望 rx_seq_jump */
+    uint32_t reboots;    /* 交付帧之间真实发生的会话切换 */
+    uint32_t undetected; /* 其中按协议无法识别的（已知局限） */
+} seq_expect_t;
+
+/*
+ * 根据真实会话推出期望的序号统计。同一会话内：丢帧数就是两帧编号之差减 1。
+ * 跨会话：新帧带 SYN 且不像"同一启动序列的后续帧"（上一帧带 SYN 且序号更小）时，
+ * 协议保证可识别；否则属于已知局限，按 7 位序号差值退化处理。
+ */
+static seq_expect_t seq_oracle(const uint32_t *expect, size_t n_expect, const uint8_t *ctl,
+                               const uint32_t *sess)
+{
+    seq_expect_t e = {0, 0, 0, 0, 0};
+    for (size_t k = 1; k < n_expect; k++) {
+        uint32_t a = expect[k - 1], b = expect[k];
+        unsigned sa = ctl[a] & STLV_SEQ_MASK, sb = ctl[b] & STLV_SEQ_MASK;
+        int syn_a = (ctl[a] & STLV_FLAG_SYN) != 0, syn_b = (ctl[b] & STLV_FLAG_SYN) != 0;
+        if (sess[a] == sess[b]) {
+            CHECK(b - a - 1 <= STLV_SEQ_GAP_MAX); /* 场景须保证同会话内连续丢帧不超限 */
+            e.lost += b - a - 1;
+            continue;
+        }
+        e.reboots++;
+        if (syn_b && !(syn_a && sa < sb)) {
+            e.reset++;
+            continue;
+        }
+        e.undetected++;
+        unsigned gap = (sb - sa - 1u) & STLV_SEQ_MASK;
+        if (gap != 0 && gap <= STLV_SEQ_GAP_MAX) {
+            e.lost += gap;
+        } else if (gap != 0) {
+            e.jump++;
+        }
+    }
+    return e;
+}
+
 /* ---------------------------------------------------------------------- */
 
 static void run_scenario(const scenario_t *sc, uint32_t seed, uint32_t frames)
@@ -275,18 +322,42 @@ static void run_scenario(const scenario_t *sc, uint32_t seed, uint32_t frames)
     stream_t st = {0};
     size_t *start = (size_t *)malloc(sizeof(size_t) * frames);
     uint32_t *expect = (uint32_t *)malloc(sizeof(uint32_t) * frames);
-    uint8_t *expected = (uint8_t *)calloc(frames, 1);
+    uint8_t *ctl = (uint8_t *)malloc(frames);
+    uint32_t *sess = (uint32_t *)malloc(sizeof(uint32_t) * frames);
     unsigned corruptions = 0;
 
-    /* 1. 发送端 + 信道 */
+    /* 1. 发送端 + 信道；发送端序号/SYN 规则与库一致，但在这里独立实现 */
     st.idle_at = (size_t *)malloc(sizeof(size_t) * (frames + 1));
+    uint32_t cur_sess = 0;
+    unsigned tx_seq = 0, syn_left = STLV_SYN_FRAMES;
+    size_t prev_end = 0, prev_n = 0;
     for (uint32_t i = 0; i < frames; i++) {
+        if (i != 0 && chance(&r, sc->reboot)) {
+            cur_sess++;
+            tx_seq = 0;
+            syn_left = STLV_SYN_FRAMES;
+            /* 一半概率：重启时上一帧还没发完 */
+            if (prev_n > 1 && st.len == prev_end && chance(&r, 500)) {
+                st.len -= 1 + rnd_below(&r, (uint32_t)(prev_n - 1));
+                while (st.n_idle != 0 && st.idle_at[st.n_idle - 1] > st.len) {
+                    st.n_idle--;
+                }
+            }
+            add_noise(&r, &st); /* bootloader 打印 */
+        }
+        ctl[i] = (uint8_t)(tx_seq | (syn_left != 0 ? STLV_FLAG_SYN : 0u));
+        sess[i] = cur_sess;
+        tx_seq = (tx_seq + 1u) & STLV_SEQ_MASK;
+        syn_left -= syn_left != 0;
+
         uint8_t f[STLV_MAX_FRAME];
         stlv_builder_t b;
         gen_payload(seed, i, f, &b);
-        size_t n = stlv_build_finish(&b, (uint8_t)i);
+        size_t n = stlv_build_finish(&b, ctl[i]);
 
         start[i] = channel(&r, sc, f, n, &st, &corruptions);
+        prev_end = st.len;
+        prev_n = start[i] == NOT_SENT ? 0 : st.len - start[i];
         if (chance(&r, sc->noise)) {
             add_noise(&r, &st);
         }
@@ -295,19 +366,14 @@ static void run_scenario(const scenario_t *sc, uint32_t seed, uint32_t frames)
         }
     }
     uint64_t expect_bytes;
-    size_t n_expect = oracle(seed, frames, start, &st, expect, &expect_bytes);
-    for (size_t i = 0; i < n_expect; i++) {
-        expected[expect[i]] = 1;
-    }
-    /* 丢帧推断只覆盖不超过 STLV_SEQ_GAP_MAX 的连续丢失 */
-    for (size_t i = 1; i < n_expect; i++) {
-        CHECK(expect[i] - expect[i - 1] <= STLV_SEQ_GAP_MAX + 1u);
-    }
+    size_t n_expect = oracle(seed, frames, start, ctl, &st, expect, &expect_bytes);
+    seq_expect_t se = seq_oracle(expect, n_expect, ctl, sess);
 
     /* 2. 接收端：随机分块喂入，遇到空闲点 flush */
     rx_check_t chk;
     memset(&chk, 0, sizeof(chk));
     chk.seed = seed;
+    chk.ctl = ctl;
     chk.cap_delivered = frames;
     chk.delivered = (uint32_t *)malloc(sizeof(uint32_t) * frames);
 
@@ -354,14 +420,9 @@ static void run_scenario(const scenario_t *sc, uint32_t seed, uint32_t frames)
             }
         }
 
-        if (n_expect >= 2) {
-            uint32_t lost = 0;
-            for (uint32_t i = expect[0]; i <= expect[n_expect - 1]; i++) {
-                lost += !expected[i];
-            }
-            CHECK_EQ(s->rx_lost, lost);
-        }
-        CHECK_EQ(s->rx_seq_jump, 0);
+        CHECK_EQ(s->rx_lost, se.lost);
+        CHECK_EQ(s->rx_peer_reset, se.reset);
+        CHECK_EQ(s->rx_seq_jump, se.jump);
         CHECK_EQ(s->rx_discarded + expect_bytes, st.len);
         CHECK_EQ(chk.delivered_bytes, expect_bytes);
     } else {
@@ -378,32 +439,38 @@ static void run_scenario(const scenario_t *sc, uint32_t seed, uint32_t frames)
         }
     }
 
-    printf("    %-10s seed=%08x frames=%u expect=%zu corrupted=%u lost(seq)=%u "
-           "crc_err=%u hdr_err=%u discarded=%u false_accept=%u\n",
+    printf("    %-12s seed=%08x frames=%u expect=%zu corrupted=%u lost(seq)=%u "
+           "crc_err=%u hdr_err=%u discarded=%u reboot=%u/%u(undetectable=%u) "
+           "false_accept=%u\n",
            sc->name, (unsigned)seed, (unsigned)frames, n_expect, corruptions,
            (unsigned)s->rx_lost, (unsigned)s->err_crc, (unsigned)s->err_header,
-           (unsigned)s->rx_discarded, (unsigned)chk.false_accepts);
+           (unsigned)s->rx_discarded, (unsigned)s->rx_peer_reset, (unsigned)se.reboots,
+           (unsigned)se.undetected, (unsigned)chk.false_accepts);
 
     free(st.data);
     free(st.idle_at);
     free(start);
     free(expect);
-    free(expected);
+    free(ctl);
+    free(sess);
     free(chk.delivered);
 }
 
 static const scenario_t SCENARIOS[] = {
-    /* name        drop  dropB dupB  flip  trunc noise idle */
-    {"clean",      0,    0,    0,    0,    0,    0,    0},
-    {"clean-idle", 0,    0,    0,    0,    0,    0,    300},
-    {"frame-loss", 150,  0,    0,    0,    0,    0,    0},
-    {"byte-loss",  0,    100,  0,    0,    0,    0,    50},
-    {"byte-dup",   0,    0,    100,  0,    0,    0,    50},
-    {"bit-flip",   0,    0,    0,    150,  0,    0,    0},
-    {"truncate",   0,    0,    0,    0,    100,  0,    200},
-    {"noise",      0,    0,    0,    0,    0,    300,  100},
-    {"mixed",      50,   50,   30,   50,   30,   100,  100},
-    {"burst",      300,  150,  50,   100,  100,  300,  50},
+    /* name          drop  dropB dupB  flip  trunc noise idle  reboot */
+    {"clean",        0,    0,    0,    0,    0,    0,    0,    0},
+    {"clean-idle",   0,    0,    0,    0,    0,    0,    300,  0},
+    {"frame-loss",   150,  0,    0,    0,    0,    0,    0,    0},
+    {"byte-loss",    0,    100,  0,    0,    0,    0,    50,   0},
+    {"byte-dup",     0,    0,    100,  0,    0,    0,    50,   0},
+    {"bit-flip",     0,    0,    0,    150,  0,    0,    0,    0},
+    {"truncate",     0,    0,    0,    0,    100,  0,    200,  0},
+    {"noise",        0,    0,    0,    0,    0,    300,  100,  0},
+    {"mixed",        50,   50,   30,   50,   30,   100,  100,  0},
+    {"burst",        300,  150,  50,   100,  100,  300,  50,   0},
+    {"reboot",       0,    0,    0,    0,    0,    0,    100,  20},
+    {"reboot-lossy", 100,  30,   30,   50,   30,   100,  100,  20},
+    {"reboot-storm", 300,  50,   50,   100,  50,   200,  50,   150},
 };
 
 static void test_fault_injection(void)

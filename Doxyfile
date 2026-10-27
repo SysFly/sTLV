@@ -1,0 +1,15 @@
+PROJECT_NAME           = sTLV
+PROJECT_BRIEF          = "MCU 串口 TLV 帧协议库"
+OUTPUT_DIRECTORY       = build/docs
+OUTPUT_LANGUAGE        = English
+INPUT                  = include README.md
+USE_MDFILE_AS_MAINPAGE = README.md
+FILE_PATTERNS          = *.h *.md
+OPTIMIZE_OUTPUT_FOR_C  = YES
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = YES
+TYPEDEF_HIDES_STRUCT   = YES
+GENERATE_LATEX         = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = NO
+QUIET                  = YES
